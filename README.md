@@ -76,6 +76,17 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 产物引用（`源文件`/`解析节点`/`分块节点`/`抽取产物`）按**文档身份**精确匹配，
+  不再用字符串包含：`doc-12` 不会命中 `doc-120`。只省略目录、扩展名或产物后缀
+  的短路径仍归一到同一身份，身份规则见 `backend/app/services/artifact_refs.py`。
+- 解析完成后会登记**产物反查绑定记录**（`data/lineage/bindings.jsonl`，
+  `产物引用 → 来源文件/文档身份`）。重跑入口据此选入源数据：
+  `GET /api/extract_lineage/resolve?artifact=...` 反查来源，
+  `GET /api/parse_retry/{重采编号}/rerun-source` 预检，
+  `POST /api/parse_retry/{重采编号}/prepare-rerun` 选入重跑。
+- 只有来源唯一且已核实的结果可以直接重跑；历史引用存在多个来源候选时返回
+  `待核项` 清单（可调查材料）并阻止重跑，不按列表顺序挑一个来源。重跑生成的新
+  解析记录会写入 `upstream_*` / `rerun_from` 字段，沿用上游身份。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

@@ -8,6 +8,7 @@ import time
 import re
 from typing import Any
 
+from app.services.artifact_refs import canonical_reference
 from app.services.base import BaseModuleService, _ensure_dir
 from app.store import store
 
@@ -84,6 +85,9 @@ class FormatParseService(BaseModuleService):
         start_time = time.time()
         doc_id = task["文档编号"]
         parser = task["解析器类型"]
+        upstream = dict(task.get("上游身份") or {})
+        if not upstream:
+            upstream = self._resolve_upstream_identity(task)
 
         try:
             # 模拟文档解析
@@ -92,11 +96,11 @@ class FormatParseService(BaseModuleService):
             table_regions = self._detect_table_regions(pages)
             image_regions = self._detect_image_regions(pages)
 
-            # 写入解析产物
+            # 写入解析产物；被重跑沿用的上游身份一并写入结果记录
             output_path = self._data_dir("parsed") / f"{doc_id}_parsed.jsonl"
             parsed_records = []
             for p in pages:
-                parsed_records.append({
+                record = {
                     "doc_id": doc_id,
 # 数据产物：解析page产物数据写入jsonl文件
                     "page_num": p["page"],
@@ -106,7 +110,17 @@ class FormatParseService(BaseModuleService):
                     "has_images": p["has_images"],
                     "parser": parser,
                     "content_hash": self._compute_checksum("\n".join(p["paragraphs"])),
-                })
+                }
+                if upstream:
+                    record.update({
+                        "upstream_source": upstream.get("来源文件", ""),
+                        "upstream_document": upstream.get("文档身份", ""),
+                        "upstream_artifact": upstream.get("产物引用", ""),
+                        "upstream_binding": upstream.get("绑定编号", ""),
+                        "upstream_task": upstream.get("解析任务编号", ""),
+                        "rerun_from": upstream.get("重采编号", ""),
+                    })
+                parsed_records.append(record)
             written = self._write_jsonl(output_path, parsed_records)
 
             # 写入表格区域到共享产物，供table_extract读取
@@ -126,6 +140,10 @@ class FormatParseService(BaseModuleService):
             if elapsed > float(task.get("超时秒数") or 300):
                 task["abnormal"] = True
 
+            if upstream:
+                # 新解析结果记录的沿用身份同时停留在任务上，便于再次核查
+                task["上游身份"] = upstream
+                task["重采编号"] = upstream.get("重采编号", "")
             # 写入检查点
             self._write_checkpoint(f"parse_{doc_id}", {
                 "task_id": task_id,
@@ -135,6 +153,7 @@ class FormatParseService(BaseModuleService):
                 "elapsed": elapsed,
                 "table_count": len(table_regions),
                 "image_count": len(image_regions),
+                "upstream": upstream,
             })
 
             # 跨模块自动触发
@@ -145,12 +164,15 @@ class FormatParseService(BaseModuleService):
             triggers["layout_restore"] = trig_layout
             trig_quality = self._trigger_quality_check(doc_id)
             triggers["extract_quality"] = trig_quality
+            trig_lineage = self._trigger_lineage_record(doc_id)
+            triggers["extract_lineage"] = trig_lineage
 
             return {
                 "task_id": task_id,
                 "doc_id": doc_id,
                 "pages": len(pages),
                 "records_written": written,
+                "upstream": upstream,
 # 【数据工程】解析操作完成后触发下游分块数据集消费
                 "elapsed": round(elapsed, 2),
                 "output": str(output_path),
@@ -160,6 +182,63 @@ class FormatParseService(BaseModuleService):
             task["status"] = "解析失败"
             task["abnormal"] = True
             return {"task_id": task_id, "error": str(e), "doc_id": doc_id}
+
+    def _resolve_upstream_identity(self, task: dict[str, Any]) -> dict[str, Any]:
+        """重跑任务通过产物反查绑定记录确定源数据身份，供新解析结果沿用。
+
+        只有反查结果唯一且已核实时才返回可沿用的上游身份；存在歧义时
+        返回空字典，让本次解析按自身文档编号独立记录，不臆测上游。
+        """
+        retry_id = str(task.get("重采编号") or "")
+        if not retry_id:
+            return {}
+        retry = self._find_retry_task(retry_id)
+        # 重跑入口通常从产物反查绑定记录选入源数据，引用就在重采任务的产物引用上。
+        # 反查不到唯一来源时，不把不相关的文档身份写成这次解析的上游。
+        resolution = self._lineage_resolution(retry, task)
+        if not resolution:
+            return {}
+        source, artifact_reference = resolution
+        return {
+            "来源文件": source.get("来源文件", ""),
+            "文档身份": source.get("文档身份", ""),
+            "产物引用": artifact_reference,
+            "绑定编号": source.get("绑定编号", ""),
+            "解析任务编号": source.get("解析任务编号", ""),
+            "重采编号": retry_id,
+            "依据": source.get("依据", []),
+        }
+
+    def _lineage_resolution(
+        self, retry: dict[str, Any], task: dict[str, Any]
+    ) -> tuple[dict[str, Any], str] | None:
+        """反查重采任务选入的源数据；只有唯一且已核实返回 (源数据, 产物引用)。"""
+        artifact_reference = str(retry.get("产物引用") or "")
+        if not artifact_reference:
+            return None
+        try:
+            lineage_cls = self._safe_import(
+                "app.services.extract_lineage", "ExtractLineageService")
+            resolved = lineage_cls().resolve_source_candidates(artifact_reference)
+        except Exception:
+            return None
+        if resolved.get("status") != "已确定" or not resolved.get("resolved"):
+            return None
+        source = resolved["resolved"]
+        # 反查出的源数据必须就是本次要重跑的文档，避免把别的文档身份挂上来
+        source_identity = canonical_reference(source.get("文档身份", ""))
+        task_identity = canonical_reference(task.get("文档编号", ""))
+        if source_identity and task_identity and source_identity != task_identity:
+            return None
+        return source, artifact_reference
+
+    def _find_retry_task(self, retry_id: str) -> dict[str, Any]:
+        """在重采任务文件里按编号查找任务，供重跑入口读取源数据引用。"""
+        for rf in sorted(self._data_dir("retries").glob("*.jsonl")):
+            for task in self._read_jsonl(rf):
+                if str(task.get("重采编号")) == retry_id:
+                    return task
+        return {}
 
     def _simulate_pages(self, content: list[str]) -> list[dict[str, Any]]:
         """模拟将文本内容切分为多页文档，每页含段落、表格和图片区域标记。"""
